@@ -21,8 +21,9 @@ def save_flat_table(tables, path=None, title="") -> None:
     integers within +/-999999999999999, and XML-safe text <=32767 UTF-16 units.
     Other Excel numeric precision limits apply. Invalid writes may leave a
     partial file. Rows stream with constant_memory; input frames stay in memory.
-    Every sheet has width 5 from A through 20 columns beyond the table (up to
-    XFD), freezes rows 1-6 at A7, and filters the complete table starting at B6.
+    Hard values only: row/column numbers are literal integers, never formulas.
+    Formula-like input strings stay text. Every column A:XFD has width 5.
+    Every sheet uses 85% zoom, freezes rows 1-6 at A7, and filters from B6.
 
     save_flat_table(df)
     save_flat_table({"Orders": orders, "Lines": lines}, "out.xlsx",
@@ -31,6 +32,9 @@ def save_flat_table(tables, path=None, title="") -> None:
     import math
     import re
     import sys
+    from shutil import copyfileobj
+    from tempfile import TemporaryDirectory
+    from zipfile import ZipFile
     from datetime import date, datetime
     from pathlib import Path
 
@@ -196,7 +200,7 @@ def save_flat_table(tables, path=None, title="") -> None:
             ws.set_paper(9)
             ws.set_portrait()
             ws.set_margins(0.7, 0.7, 0.75, 0.75)
-            ws.set_column(0, min(16383, last_col + 20), 5)
+            ws.set_column(0, 16383, 5)
             ws.freeze_panes(6, 0)
 
             if "_x" in sheet_title:
@@ -205,7 +209,7 @@ def save_flat_table(tables, path=None, title="") -> None:
             else:
                 ws.write_string(1, 1, f"Таблица: {sheet_title}", bold)
             for col in range(1, last_col + 1):
-                ws.write_formula(3, col, "=COLUMN()-COLUMN($A$4)", center, col)
+                ws.write_number(3, col, col, center)
             ws.set_row(5, 48.65)
             for col, header in enumerate(headers, 1):
                 header_fmt = black if col in (1, last_col) else blue
@@ -226,7 +230,7 @@ def save_flat_table(tables, path=None, title="") -> None:
                     else df.iter_rows()
                 )
             for row, values in enumerate(rows, 6):
-                ws.write_formula(row, 1, "=ROW()-ROW($B$6)", center, row - 5)
+                ws.write_number(row, 1, row - 5, center)
                 for col, value in enumerate(values, 2):
                     if pandas_frame:
                         if value is pd.NA or value is pd.NaT:
@@ -298,3 +302,25 @@ def save_flat_table(tables, path=None, title="") -> None:
                 ws.write_number(row, last_col, 1, center)
 
             ws.autofilter(5, 1, max(5, df.shape[0] + 5), last_col)
+
+    # OOXML includes padding: 5.81640625 stores Excel width 5 in Calibri 11.
+    # Stream-copy the workbook, changing column metadata only.
+    with TemporaryDirectory(dir=path.parent) as folder:
+        fixed = Path(folder) / "flat_table.xlsx"
+        with ZipFile(path) as source, ZipFile(fixed, "w") as target:
+            for info in source.infolist():
+                with source.open(info) as reader, target.open(info, "w") as writer:
+                    if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", info.filename):
+                        header, marker, data = reader.read(65536).partition(
+                            b"<sheetData>"
+                        )
+                        header, count = re.subn(
+                            rb'(<col\b[^>]*\bwidth=")[^"]+(")',
+                            rb"\g<1>5.81640625\2",
+                            header,
+                        )
+                        if not marker or count != 1:
+                            raise ValueError("Unexpected worksheet column layout")
+                        writer.write(header + marker + data)
+                    copyfileobj(reader, writer, 1024 * 1024)
+        fixed.replace(path)
