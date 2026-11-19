@@ -1,26 +1,25 @@
-def analyze_header(df):
-    """Return one row per input field as a pandas or eager Polars DataFrame.
+def header_info(df):
+    """Return one row per input column as a pandas or eager Polars DataFrame.
 
-    The output uses the input backend. Position is 1-based and Field is the
-    input label as text. Counts follow flat-table blanks, newlines and datetime
-    precision. Distinctness keeps types separate in mixed pandas columns.
-    Row 1–3 and the first five distinct examples are text previews. Flags are 1/0.
+    The output uses the input backend. idx is zero-based, and col name is the
+    input label as text. notna count and isna count follow the flat-table blank
+    rules. unique count uses export precision and counts pandas types separately.
+    Row 1–3 and the first five unique examples are text previews. Flags are 1/0.
     Requires pandas or Polars for the corresponding input.
     """
     return _analyze_columns(df, detail=False)
 
 
-def analyze_header_dtype(df):
-    """Return column stats and one row per present value type in each field.
+def check_dtypes(df):
+    """Return column stats and one row per nonblank elements_dtype per column.
 
-    Accepts and returns a pandas or eager Polars DataFrame. Column counts
-    repeat for mixed fields; estimated memory (MiB) appears once per field.
-    Low/high and shortest/longest contain up to three distinct examples.
-    One run checks whether each distinct string/integer occurs in a single
-    consecutive run within the present values of its type.
-    Text length SD is sample SD (zero for a single value). Text character
-    counts are exact; the sorted inventory is capped at Excel's cell limit.
-    Flags are 1/0. An all-blank field has one row with blank type-specific metrics.
+    Accepts and returns a pandas or eager Polars DataFrame. Counts repeat for
+    mixed columns. memory, MB is estimated in decimal MB once per input column.
+    str key stats gives mi, mx, me, st (min, max, mean, and sample SD of length).
+    Low/high and shortest/longest give up to three unique examples per type.
+    all_unique(unique_justseen(els)) checks for repeated runs within str or int.
+    Char count is exact. Characters is capped at Excel's cell limit.
+    Flags are 1/0. An all-blank column has one row with blank type-specific stats.
     """
     return _analyze_columns(df, detail=True)
 
@@ -169,10 +168,8 @@ def _analyze_columns(df, *, detail):
         encoded = alphabet.encode("utf-16-le")
         if len(encoded) > 65534:
             alphabet = encoded[:65532].decode("utf-16-le", "ignore") + "…"
-        return (
-            int(lengths.min()), maximum, float(lengths.mean()), float(sd),
-            examples(shortest), examples(longest), len(chars), alphabet,
-        )
+        str_key_stats = f"mi={int(lengths.min())} mx={maximum} me={lengths.mean():.15g} st={sd:.15g}"
+        return str_key_stats, examples(shortest), examples(longest), len(chars), alphabet
 
     def describe(kind, values):
         native = pl is not None and isinstance(values, pl.Series)
@@ -183,9 +180,9 @@ def _analyze_columns(df, *, detail):
             unique = pd.Series(values.unique())
         else:
             unique = list(dict.fromkeys(values))
-        count, distinct = len(values), len(unique)
+        count, unique_count = len(values), len(unique)
         if not detail:
-            return count, distinct, list(unique[:5])
+            return count, unique_count, list(unique[:5])
 
         low = high = true = false = None
         if kind == "bool":
@@ -203,58 +200,65 @@ def _analyze_columns(df, *, detail):
         else:
             low, high = examples(nsmallest(3, unique)), examples(nlargest(3, unique))
 
-        one_run = None
+        all_unique_justseen = None
         if kind in ("str", "int"):
-            if distinct in (1, count):
-                one_run = True
+            if unique_count in (1, count):
+                all_unique_justseen = True
             elif native:
-                one_run = values.rle_id().max() + 1 == distinct
+                all_unique_justseen = values.rle_id().max() + 1 == unique_count
             elif pandas_series:
                 array = values.to_numpy()
-                one_run = bool((array[1:] != array[:-1]).sum() + 1 == distinct)
+                all_unique_justseen = (array[1:] != array[:-1]).sum() + 1 == unique_count
             else:
-                one_run = 1 + sum(a != b for a, b in zip(values, values[1:])) == distinct
-        text = text_metrics(values, unique, native) if kind == "str" else (None,) * 8
-        flag = None if one_run is None else int(one_run)
-        return count, distinct, (kind, count, distinct, int(count == distinct), flag, low, high, true, false, *text)
+                all_unique_justseen = 1 + sum(a != b for a, b in zip(values, values[1:])) == unique_count
+        str_key_stats, *text = text_metrics(values, unique, native) if kind == "str" else (None,) * 5
+        flag = None if all_unique_justseen is None else int(all_unique_justseen)
+        properties = (kind, count, unique_count, int(count == unique_count), flag, low, high, true, false, *text)
+        return count, unique_count, (str_key_stats, *properties)
 
     columns = {
-        "Position": int, "Field": str, "Dtype": str,
-        "Distinct": int, "Present": int, "Blank": int, "All unique": int,
+        "idx": int, "col name": str, "unique count": int, "notna count": int, "isna count": int,
     }
     if detail:
-        type_columns = {
-            "Value type": str, "Type count": int, "Type distinct": int,
-            "Type uniq?": int, "One run": int, "Low 3": str, "High 3": str,
-            "True count": int, "False count": int, "Min length": int, "Max length": int,
-            "Mean length": float, "Length SD": float, "Shortest 3": str, "Longest 3": str,
+        elements_columns = {
+            "elements_dtype": str, "elements count": int, "elements unique count": int,
+            "elements all_unique_flag": int, "all_unique(unique_justseen(els))": int,
+            "Low 3": str, "High 3": str, "True count": int, "False count": int,
+            "Shortest 3": str, "Longest 3": str,
             "Char count": int, "Characters": str,
         }
-        columns.update({"MiB": float, **type_columns})
+        columns.update({
+            "memory, MB": float, "str key stats": str, "series_dtype": str,
+            **elements_columns, "all_unique_flag": int,
+        })
     else:
-        columns.update({"Row 1": str, "Row 2": str, "Row 3": str, "Examples": str})
+        columns.update({"dtype": str, "examples": str, "all_unique_flag": int,
+                        "Row 1": str, "Row 2": str, "Row 3": str})
 
     rows = []
-    for position, label in enumerate(df.columns, 1):
-        series = df.to_series(position - 1) if polars_frame else df.iloc[:, position - 1]
+    for idx, col_name in enumerate(df.columns):
+        series = df.to_series(idx) if polars_frame else df.iloc[:, idx]
         groups, first = groups_for(series)
         stats = [describe(kind, values) for kind, values in groups.items() if len(values)]
-        present = sum(count for count, _, _ in stats)
-        distinct = sum(count for _, count, _ in stats)
+        notna_count = sum(count for count, _, _ in stats)
+        unique_count = sum(count for _, count, _ in stats)
         height = len(series)
-        field = (
-            position, str(label), str(series.dtype), distinct, present,
-            height - present, int(height > 0 and distinct == height),
-        )
+        counts = (idx, str(col_name), unique_count, notna_count, height - notna_count)
+        series_dtype = str(series.dtype)
+        all_unique_flag = int(height > 0 and unique_count == height)
         if detail:
-            mib = series.estimated_size("mb") if polars_frame else series.memory_usage(index=False, deep=True) / 2**20
-            types = [properties for _, _, properties in stats] or [(None,) * len(type_columns)]
-            rows.extend((*field, mib if i == 0 else None, *properties) for i, properties in enumerate(types))
+            memory_bytes = (
+                series.estimated_size() if polars_frame else series.memory_usage(index=False, deep=True)
+            )
+            types = [properties for _, _, properties in stats] or [(None,) * (1 + len(elements_columns))]
+            for i, (str_key_stats, *elements) in enumerate(types):
+                memory_mb = memory_bytes / 10**6 if i == 0 else None
+                rows.append((*counts, memory_mb, str_key_stats, series_dtype, *elements, all_unique_flag))
         else:
             sample = [preview(scalar(value)) for value in series.head(3).to_list()]
             sample.extend([None] * (3 - len(sample)))
-            distinct_examples = first if first is not None else stats[0][2] if stats else []
-            rows.append((*field, *sample, examples(distinct_examples)))
+            unique_examples = first if first is not None else stats[0][2] if stats else []
+            rows.append((*counts, series_dtype, examples(unique_examples), all_unique_flag, *sample))
 
     if polars_frame:
         dtypes = {int: pl.Int64, str: pl.String, float: pl.Float64}
