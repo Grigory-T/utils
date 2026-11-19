@@ -2,8 +2,9 @@ def header_info(df):
     """Return one row per input column as a pandas or eager Polars DataFrame.
 
     The output uses the input backend. idx is zero-based, and col name is the
-    input label as text. notna count and isna count follow the flat-table blank
-    rules. unique count uses export precision and counts pandas types separately.
+    input label as text. col_n is the number of input columns. notna count and
+    isna count follow the flat-table blank rules. unique count uses export
+    precision and counts pandas types separately.
     Row 1–3 and the first five unique examples are text previews. Flags are 1/0.
     Requires pandas or Polars for the corresponding input.
     """
@@ -13,8 +14,9 @@ def header_info(df):
 def check_dtypes(df):
     """Return column stats and one row per nonblank elements_dtype per column.
 
-    Accepts and returns a pandas or eager Polars DataFrame. Counts repeat for
-    mixed columns. memory, MB is estimated in decimal MB once per input column.
+    Accepts and returns a pandas or eager Polars DataFrame. col_n is the number
+    of input columns. Counts repeat for mixed columns. memory, MB is estimated
+    in decimal MB once per input column.
     str key stats gives mi, mx, me, st (min, max, mean, and sample SD of length).
     Low/high and shortest/longest give up to three unique examples per type.
     all_unique(unique_justseen(els)) checks for repeated runs within str or int.
@@ -217,7 +219,8 @@ def _analyze_columns(df, *, detail):
         return count, unique_count, (str_key_stats, *properties)
 
     columns = {
-        "idx": int, "col name": str, "unique count": int, "notna count": int, "isna count": int,
+        "idx": int, "col name": str, "col_n": int,
+        "unique count": int, "notna count": int, "isna count": int,
     }
     if detail:
         elements_columns = {
@@ -235,6 +238,7 @@ def _analyze_columns(df, *, detail):
         columns.update({"dtype": str, "examples": str, "all_unique_flag": int,
                         "Row 1": str, "Row 2": str, "Row 3": str})
 
+    col_n = df.shape[1]
     rows = []
     for idx, col_name in enumerate(df.columns):
         series = df.to_series(idx) if polars_frame else df.iloc[:, idx]
@@ -243,7 +247,7 @@ def _analyze_columns(df, *, detail):
         notna_count = sum(count for count, _, _ in stats)
         unique_count = sum(count for _, count, _ in stats)
         height = len(series)
-        counts = (idx, str(col_name), unique_count, notna_count, height - notna_count)
+        counts = (idx, str(col_name), col_n, unique_count, notna_count, height - notna_count)
         series_dtype = str(series.dtype)
         all_unique_flag = int(height > 0 and unique_count == height)
         if detail:
