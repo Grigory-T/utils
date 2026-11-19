@@ -1,4 +1,4 @@
-def save_flat_table(tables, path=None, title="") -> None:
+def save_flat_table(tables, path=None, title="", header_analysis=False) -> None:
     """Write pandas/Polars tables to a new/overwritten .xlsx file; return None.
 
     Dependencies: XlsxWriter and pandas and/or polars; neither frame library
@@ -23,7 +23,12 @@ def save_flat_table(tables, path=None, title="") -> None:
     partial file. Rows stream with constant_memory; input frames stay in memory.
     Hard values only: row/column numbers are literal integers, never formulas.
     Formula-like input strings stay text. Every column A:XFD has width 5.
-    Every sheet uses 85% zoom, freezes rows 1-6 at A7, and filters from B6.
+    Data sheets use 85% zoom, freeze rows 1-6 at A7, and filter from B6.
+    header_analysis: bool, False by default. True adds header and header_dtype
+    views for each table, prefixed by the data sheet name for multiple tables.
+    They include three source rows, distinct examples, counts, value types,
+    column memory in MiB, and text length, character and range summaries.
+    Counts and examples exclude exported blanks; distinctness is per value type.
 
     save_flat_table(df)
     save_flat_table({"Orders": orders, "Lines": lines}, "out.xlsx",
@@ -303,6 +308,290 @@ def save_flat_table(tables, path=None, title="") -> None:
 
             ws.autofilter(5, 1, max(5, df.shape[0] + 5), last_col)
 
+        if header_analysis:
+            from heapq import nlargest, nsmallest
+            from textwrap import wrap as wrap_text
+
+            def sample_value(value, pandas_column=False):
+                if pandas_column:
+                    if value is pd.NA or value is pd.NaT:
+                        return None
+                    if isinstance(value, np.datetime64):
+                        if np.isnat(value):
+                            return None
+                        value = pd.Timestamp(value)
+                    elif isinstance(value, np.generic):
+                        value = value.item()
+                    if isinstance(value, pd.Timestamp):
+                        value = value.to_pydatetime(warn=False)
+                if isinstance(value, str):
+                    return value.replace("\r\n", "\n").replace("\r", "\n") or None
+                if isinstance(value, float) and math.isnan(value):
+                    return None
+                if isinstance(value, datetime):
+                    return value.replace(microsecond=value.microsecond // 1000 * 1000)
+                return value
+
+            def show(value, limit=24):
+                if isinstance(value, str):
+                    return repr(value[:limit]) + ("…" if len(value) > limit else "")
+                if isinstance(value, datetime):
+                    precision = "milliseconds" if value.microsecond else "seconds"
+                    return value.isoformat(sep=" ", timespec=precision)
+                return str(value)
+
+            def ends(label1, low, label2, high):
+                return "\n".join(
+                    f"{label} " + " · ".join(show(v, 12) for v in values)
+                    for label, values in ((label1, low), (label2, high)) if len(values)
+                )
+
+            def describe(values, kind):
+                native = pl is not None and isinstance(values, pl.Series)
+                pandas_series = pd is not None and isinstance(values, pd.Series)
+                count = len(values)
+                unique = (
+                    values.unique(maintain_order=True)
+                    if native
+                    else pd.Series(values.unique())
+                    if pandas_series
+                    else list(dict.fromkeys(values))
+                )
+                distinct = len(unique)
+                examples = list(unique[:5])
+                types = f"{kind}\n{count:,} / {distinct:,}"
+                lengths = extremes = lengths_extremes = characters = ""
+                if kind == "bool":
+                    true = int(values.sum()) if native or pandas_series else sum(values)
+                    extremes = f"True {true:,}\nFalse {count - true:,}"
+                elif native:
+                    extremes = ends(
+                        "Low", unique.bottom_k(3).sort(),
+                        "High", unique.top_k(3).sort(descending=True),
+                    )
+                elif pandas_series:
+                    arrow_dtype = getattr(pd, "ArrowDtype", ())
+                    if kind in ("date", "datetime") and isinstance(unique.dtype, arrow_dtype):
+                        ordered = unique.sort_values()
+                        extremes = ends("Low", ordered.iloc[:3], "High", ordered.iloc[-3:][::-1])
+                    else:
+                        extremes = ends("Low", unique.nsmallest(3), "High", unique.nlargest(3))
+                else:
+                    extremes = ends("Low", nsmallest(3, unique), "High", nlargest(3, unique))
+
+                if kind == "str":
+                    if native:
+                        length = values.str.len_chars()
+                        unique_length = unique.str.len_chars()
+                        shortest = unique.gather(unique_length.arg_sort().head(3))
+                        longest = unique.gather(unique_length.arg_sort(descending=True).head(3))
+                        deviation = length.std(ddof=1) or 0.0
+                        minimum, maximum, mean = length.min(), length.max(), length.mean()
+                    else:
+                        length = np.fromiter(map(len, values), dtype=np.int64, count=count)
+                        shortest = nsmallest(3, unique, key=len)
+                        longest = nlargest(3, unique, key=len)
+                        deviation = length.std(ddof=1) if count > 1 else 0.0
+                        minimum, maximum, mean = length.min(), length.max(), length.mean()
+                    lengths = (
+                        f"Min {minimum:,} / max {maximum:,}\n"
+                        f"Mean {mean:,.1f} / SD {deviation:,.1f}"
+                    )
+                    lengths_extremes = ends("Short", shortest, "Long", longest)
+                    chars = set()
+                    unseen = None
+                    step = min(4096, 2**20 // int(maximum))
+                    for start in range(0, distinct, step):
+                        chunk = unique[start:start + step]
+                        text = chunk.str.join("").item() if native else "".join(chunk)
+                        previous = len(chars)
+                        chars.update(text if unseen is None else unseen.findall(text))
+                        # Skip already counted characters in columns with small alphabets.
+                        if previous != len(chars):
+                            unseen = (
+                                re.compile("[^" + re.escape("".join(chars)) + "]")
+                                if len(chars) <= 128 else None
+                            )
+                    visible = "".join(nsmallest(60, chars))
+                    characters = f"{len(chars):,}\n{visible!r}" + ("…" if len(chars) > 60 else "")
+                columns = [types, lengths, extremes, lengths_extremes, characters]
+                return count, distinct, examples, columns
+
+            def polars_strings(values):
+                if values.str.contains("\r", literal=True).any():
+                    values = values.str.replace_all(r"\r\n?", "\n")
+                values = values.filter(values != "")
+                return [describe(values, "str")] if len(values) else []
+
+            def profile(series):
+                if pl is not None and isinstance(series, pl.Series):
+                    dtype = series.dtype
+                    memory = series.estimated_size("mb")
+                    if dtype.base_type() in (pl.String, pl.Categorical, pl.Enum):
+                        groups = polars_strings(series.cast(pl.String))
+                    else:
+                        values = series.drop_nulls()
+                        if dtype.base_type() == pl.Datetime:
+                            values = values.dt.truncate("1ms")
+                            kind = "datetime"
+                        elif dtype.is_integer():
+                            kind = "int"
+                        else:
+                            kind = {pl.Boolean: "bool", pl.Date: "date"}.get(dtype, "float")
+                        groups = [describe(values, kind)] if len(values) else []
+                else:
+                    memory = series.memory_usage(index=False, deep=True) / (1024 ** 2)
+                    values = series.dropna()
+                    dtype = series.dtype
+                    kinds = {"i": "int", "u": "int", "f": "float", "b": "bool", "M": "datetime"}
+                    if values.empty:
+                        groups = []
+                    elif dtype.kind in kinds and not isinstance(dtype, pd.CategoricalDtype):
+                        kind = "date" if dtype.type is date else kinds[dtype.kind]
+                        if kind == "datetime":
+                            values = values.dt.floor("ms")
+                        groups = [describe(values, kind)]
+                    elif pd.api.types.infer_dtype(values.astype(object), skipna=False) == "string":
+                        if pl is not None:
+                            strings = pl.Series(values.to_numpy(dtype=object), dtype=pl.String)
+                            groups = polars_strings(strings)
+                        else:
+                            strings = [sample_value(v) for v in values if v != ""]
+                            groups = [describe(strings, "str")] if strings else []
+                    else:
+                        typed = {}
+                        first = {}
+                        for value in values:
+                            value = sample_value(value, pandas_column=True)
+                            if value is not None:
+                                kind = type(value).__name__
+                                typed.setdefault(kind, []).append(value)
+                                if len(first) < 5:
+                                    first[(kind, value)] = value
+                        groups = [describe(group, kind) for kind, group in typed.items()]
+                        return str(dtype), memory, list(first.values()), groups
+                return str(dtype), memory, groups[0][2] if groups else [], groups
+
+            def analysis_name(name, label):
+                prefix = f"{name} " if len(sheets) > 1 else ""
+                encoded = prefix.encode("utf-16-le")
+                suffix = label
+                number = 2
+                while True:
+                    available = 31 - len(suffix)
+                    trimmed = encoded[:available * 2].decode("utf-16-le", "ignore")
+                    candidate = (trimmed + suffix).lstrip("'")
+                    if candidate.casefold() not in seen:
+                        seen.add(candidate.casefold())
+                        return candidate
+                    suffix = f"{label}_{number}"
+                    number += 1
+
+            wrap = wb.add_format({**base, "border": 1, "text_wrap": True, "valign": "vcenter"})
+            numeric = {**base, "border": 1, "valign": "vcenter"}
+            count_fmt = wb.add_format({**numeric, "num_format": "#,##0"})
+            memory_fmt = wb.add_format({**numeric, "num_format": "0.00#"})
+            sample_date = wb.add_format({**numeric, "num_format": "yyyy-mm-dd"})
+            sample_time = wb.add_format({**numeric, "num_format": "yyyy-mm-dd hh:mm:ss.000"})
+
+            def row_height(cells, widths):
+                lines = max(
+                    sum(max(1, len(wrap_text(line, width - 2))) for line in cell.split("\n"))
+                    for cell, width in zip(cells, widths)
+                )
+                return max(22, min(106, 5 + 14 * lines))
+
+            def write_cell(ws, row, col, value, fmt):
+                if isinstance(value, str) and "_x" in value:
+                    parts = [s for s in re.split("(_)", value) if s]
+                    ws.write_rich_string(row, col, *[v for s in parts for v in (fmt, s)], fmt)
+                else:
+                    ws.write(row, col, value, fmt)
+
+            for name, df in sheets.items():
+                rows, columns = df.shape
+                pandas_column = pd is not None and isinstance(df, pd.DataFrame)
+                summary = wb.add_worksheet(analysis_name(name, "header"))
+                detail = wb.add_worksheet(analysis_name(name, "header_dtype"))
+                sample_widths = (20, 23, 23, 23)
+                summary_widths = (16, 9, 9, 9, 9, 34)
+                detail_widths = (8, 17, 18, 26, 25, 20)
+                summary_labels = ("Dtype", "Distinct", "Present", "Blank", "All unique", "Distinct examples")
+                detail_labels = (
+                    "MiB", "Type\nPresent / distinct", "Text length", "Low / high",
+                    "Shortest / longest", "Characters",
+                )
+                for ws, labels, widths in (
+                    (summary, summary_labels, summary_widths),
+                    (detail, detail_labels, detail_widths),
+                ):
+                    ws.hide_gridlines(2)
+                    ws.set_zoom(85)
+                    ws.freeze_panes(1, 3)
+                    ws.set_row(0, 44)
+                    for col, width in enumerate((4, 1, *sample_widths, 1, *widths)):
+                        ws.set_column(col, col, width)
+                    ws.write_string(0, 0, "#", blue)
+                    write_cell(ws, 0, 2, f"{name}\n{rows:,} rows · {columns + 2:,} fields", blue)
+                    for col in range(3, 6):
+                        ws.write_string(0, col, f"Row {col - 2}", blue)
+                    ws.write_row(0, 7, labels, blue)
+
+                detail_row = 1
+                for index, field in enumerate(["№пп", *sheet_headers[name], "last"], 1):
+                    technical = index in (1, columns + 2)
+                    if technical:
+                        numbered = index == 1
+                        distinct = rows if numbered else int(rows > 0)
+                        samples = [i if numbered else 1 for i in range(1, min(rows, 3) + 1)]
+                        examples = list(range(1, min(rows, 5) + 1)) if numbered else samples[:1]
+                        high = list(range(rows, max(0, rows - 3), -1)) if numbered else examples
+                        low = samples if numbered else examples
+                        dtype, memory, present = "int (generated)", None, rows
+                        properties = []
+                        if rows:
+                            extremes = ends("Low", low, "High", high)
+                            properties.append([f"int\n{rows:,} / {distinct:,}", "", extremes, "", ""])
+                    else:
+                        series = df.iloc[:, index - 2] if pandas_column else df.to_series(index - 2)
+                        dtype, memory, examples, groups = profile(series)
+                        present = sum(group[0] for group in groups)
+                        distinct = sum(group[1] for group in groups)
+                        samples = [sample_value(v, pandas_column) for v in series.head(3).to_list()]
+                        properties = [group[3] for group in groups]
+
+                    example_text = " · ".join(show(v) for v in examples)
+                    sample_text = [field[:72], *(v[:66] for v in samples if isinstance(v, str))]
+                    sample_height = row_height(sample_text, sample_widths)
+                    summary_height = row_height((dtype, example_text), (summary_widths[0], summary_widths[-1]))
+                    summary.set_row(index, max(sample_height, summary_height))
+
+                    for ws, row in ((summary, index), (detail, detail_row)):
+                        ws.write_number(row, 0, index, center)
+                        write_cell(ws, row, 2, field, black if technical else blue)
+                        for col, value in enumerate((samples + [None] * 3)[:3], 3):
+                            fmt = (
+                                sample_time if isinstance(value, datetime)
+                                else sample_date if isinstance(value, date)
+                                else wrap
+                            )
+                            write_cell(ws, row, col, value, fmt)
+
+                    summary.write_string(index, 7, dtype, wrap)
+                    summary.write_row(index, 8, (distinct, present, rows - present), count_fmt)
+                    summary.write(index, 11, "Yes" if rows and distinct == rows else None, center)
+                    write_cell(summary, index, 12, example_text, wrap)
+                    detail.write(detail_row, 7, memory, memory_fmt)
+                    for offset, cells in enumerate(properties or [["", "", "", "", ""]]):
+                        row = detail_row + offset
+                        detail.set_row(row, max(sample_height, row_height(cells, detail_widths[1:])))
+                        if offset:
+                            detail.write_number(row, 0, index, center)
+                            write_cell(detail, row, 2, field, blue)
+                        for col, value in enumerate(cells, 8):
+                            write_cell(detail, row, col, value, wrap)
+                    detail_row += max(1, len(properties))
+
     # OOXML includes padding: 5.81640625 stores Excel width 5 in Calibri 11.
     # Stream-copy the workbook, changing column metadata only.
     with TemporaryDirectory(dir=path.parent) as folder:
@@ -310,7 +599,8 @@ def save_flat_table(tables, path=None, title="") -> None:
         with ZipFile(path) as source, ZipFile(fixed, "w") as target:
             for info in source.infolist():
                 with source.open(info) as reader, target.open(info, "w") as writer:
-                    if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", info.filename):
+                    sheet = re.fullmatch(r"xl/worksheets/sheet(\d+)\.xml", info.filename)
+                    if sheet and (not header_analysis or int(sheet[1]) <= len(sheets)):
                         header, marker, data = reader.read(65536).partition(
                             b"<sheetData>"
                         )
